@@ -278,6 +278,24 @@ export default function SOCTriageTool() {
   const [diagnosis, setDiagnosis]       = useState(null);
   const [history, setHistory]           = useState([]);
   const [guideOpen, setGuideOpen]       = useState(false);
+  const [apiKey, setApiKey]             = useState(() => localStorage.getItem("groq_api_key") || "");
+  const [keyEntry, setKeyEntry]         = useState("");
+  const [showKeySetup, setShowKeySetup] = useState(false);
+
+  function saveKey() {
+    const k = keyEntry.trim();
+    if (!k) return;
+    localStorage.setItem("groq_api_key", k);
+    setApiKey(k);
+    setKeyEntry("");
+    setShowKeySetup(false);
+  }
+
+  function clearKey() {
+    localStorage.removeItem("groq_api_key");
+    setApiKey("");
+    setShowKeySetup(true);
+  }
 
   function handleInputChange(e) {
     setInput(e.target.value);
@@ -308,7 +326,7 @@ Diagnose what is wrong and give specific actionable guidance. Respond ONLY with 
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${import.meta.env.VITE_GROQ_KEY}`
+          "Authorization": `Bearer ${apiKey}`
         },
         body: JSON.stringify({
           model: "llama-3.3-70b-versatile",
@@ -330,9 +348,9 @@ Diagnose what is wrong and give specific actionable guidance. Respond ONLY with 
       return {
         problem: `Analysis failed: ${err.message}`,
         suggestions: [
-          "Make sure VITE_GROQ_KEY is set in your .env and the dev server was restarted.",
-          "Open DevTools → Console for the full error details.",
-          "If this is the deployed site, ensure the VITE_GROQ_KEY GitHub Secret is set and Actions ran."
+          "Check that your Groq API key is correct — click the key icon in the header to update it.",
+          "Get a free key at console.groq.com → API Keys.",
+          "Open DevTools → Console for the full error details."
         ],
         example: ""
       };
@@ -376,8 +394,8 @@ Log/Alert Input:
 ${input}`;
 
     try {
-      const apiKey = import.meta.env.VITE_GROQ_KEY;
-      if (!apiKey) throw new Error("VITE_GROQ_KEY is not set — add it to your .env file and restart the dev server.");
+      const apiKey = apiKey;
+      if (!apiKey) throw new Error("No API key set — enter your Groq API key using the key icon in the header.");
 
       setLoadingStage("Detecting log format...");
       await new Promise(r => setTimeout(r, 350));
@@ -427,8 +445,8 @@ ${input}`;
       setDiagnosis({
         problem: `Analysis error: ${e.message}`,
         suggestions: [
-          "Make sure VITE_GROQ_KEY is set in your .env file and the dev server was restarted.",
-          "If using the deployed site, ensure the VITE_GROQ_KEY GitHub Secret is set and the Actions workflow ran successfully.",
+          "Check that your Groq API key is correct — click the key icon in the header to update it.",
+          "Get a free key at console.groq.com → API Keys.",
           "Open DevTools → Console for the full error details."
         ],
         example: ""
@@ -517,15 +535,65 @@ ${input}`;
 
       {/* Header */}
       <div style={{ borderBottom:"1px solid #1a2e24", padding:"24px 32px", display:"flex", alignItems:"center", gap:16, background:"rgba(0,255,136,0.02)" }}>
-        <div style={{ width:10, height:10, borderRadius:"50%", background:"#00ff88", animation:"pulse 2s infinite" }} />
+        <div style={{ width:10, height:10, borderRadius:"50%", background: apiKey ? "#00ff88" : "#ff9f0a", animation:"pulse 2s infinite" }} />
         <div>
           <div style={{ fontFamily:"'Orbitron',monospace", fontSize:13, fontWeight:700, letterSpacing:4, color:"#00ff88" }}>SOC TRIAGE</div>
           <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginTop:1 }}>AI-POWERED ALERT ANALYSIS SYSTEM v2.0</div>
         </div>
-        <div style={{ marginLeft:"auto", fontSize:10, color:"#3a5a48", letterSpacing:1 }}>
-          {new Date().toISOString().slice(0,19).replace("T"," ")} UTC
+        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:16 }}>
+          <button
+            onClick={() => setShowKeySetup(s => !s)}
+            title={apiKey ? "API key set — click to change" : "No API key — click to set"}
+            style={{
+              background:"transparent", border:`1px solid ${apiKey ? "#1a2e24" : "#ff9f0a"}`,
+              color: apiKey ? "#3a5a48" : "#ff9f0a", padding:"4px 10px", fontSize:10,
+              cursor:"pointer", letterSpacing:1, fontFamily:"inherit", transition:"all 0.15s"
+            }}
+          >
+            {apiKey ? "⚿ KEY SET" : "⚿ SET API KEY"}
+          </button>
+          <span style={{ fontSize:10, color:"#3a5a48", letterSpacing:1 }}>
+            {new Date().toISOString().slice(0,19).replace("T"," ")} UTC
+          </span>
         </div>
       </div>
+
+      {/* API Key Setup Panel */}
+      {(!apiKey || showKeySetup) && (
+        <div style={{ background:"#0a1208", borderBottom:"1px solid #1a2e24", padding:"16px 32px", animation:"fadeIn 0.2s ease" }}>
+          <div style={{ maxWidth:960, margin:"0 auto", display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+            <div style={{ fontSize:10, color: apiKey ? "#3a5a48" : "#ff9f0a", letterSpacing:2, flexShrink:0 }}>
+              {apiKey ? "// UPDATE GROQ API KEY" : "// GROQ API KEY REQUIRED"}
+            </div>
+            <input
+              type="password"
+              value={keyEntry}
+              onChange={e => setKeyEntry(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && saveKey()}
+              placeholder="gsk_..."
+              style={{
+                flex:1, minWidth:260, background:"#0d1517", border:"1px solid #1a2e24",
+                color:"#c9d8d3", padding:"6px 12px", fontSize:11, fontFamily:"inherit",
+                outline:"none"
+              }}
+            />
+            <button onClick={saveKey} disabled={!keyEntry.trim()} style={{
+              background:"transparent", border:"1px solid #00ff88", color:"#00ff88",
+              padding:"6px 16px", fontSize:10, cursor: keyEntry.trim() ? "pointer" : "default",
+              letterSpacing:2, fontFamily:"inherit", opacity: keyEntry.trim() ? 1 : 0.4
+            }}>SAVE</button>
+            {apiKey && (
+              <button onClick={clearKey} style={{
+                background:"transparent", border:"1px solid #2a1a08", color:"#5a4a38",
+                padding:"6px 12px", fontSize:10, cursor:"pointer", letterSpacing:1, fontFamily:"inherit"
+              }}>CLEAR</button>
+            )}
+            <span style={{ fontSize:10, color:"#3a5a48" }}>
+              Free key at <span style={{ color:"#5a8a6a" }}>console.groq.com</span>
+            </span>
+          </div>
+        </div>
+      )}
 
       <div style={{ maxWidth:960, margin:"0 auto", padding:"32px 24px" }}>
 
