@@ -161,6 +161,290 @@ const SEVERITY_CONFIG = {
   INFORMATIONAL: { color: "#64d2ff", bg: "rgba(100,210,255,0.10)", label: "INFO" }
 };
 
+// ── OFFLINE ANALYSIS ENGINE ─────────────────────────────────────────────────
+
+const IP_RE = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g;
+function uniq(a) { return [...new Set(a.filter(Boolean))]; }
+function extractIPs(t) { return uniq(t.match(IP_RE) || []); }
+
+function detectFormat(t) {
+  if (/^CEF:\d+\|/i.test(t))                                                    return "CEF";
+  if (t.trim().startsWith("{") && /"event_type"|"alert"|"signature"/.test(t))   return "Suricata JSON";
+  if (/#fields\s+ts\b/.test(t) || /^\d{10,}\.\d+\s+\S+\s+\d+\.\d+\.\d+\.\d+/m.test(t)) return "Zeek conn.log";
+  if (/EventID\s*:\s*\d+/i.test(t))                                             return "Windows Event Log";
+  if (/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d/m.test(t))      return "Syslog";
+  if (/Timestamp:.*\d{4}-\d{2}-\d{2}|Query:\s*\S+\.\S+/i.test(t))             return "DNS Log";
+  return "Free-form Narrative";
+}
+
+function analyzeOffline(text) {
+  const t = text.trim();
+  const fmt = detectFormat(t);
+  const ips = extractIPs(t);
+
+  const r = {
+    severity: "MEDIUM", log_format_detected: fmt,
+    summary: "", threat_type: "Suspicious Activity",
+    mitre_tactic: "Unknown", mitre_technique: "Unknown",
+    iocs: ips, recommended_action: "Investigate and correlate with other events.",
+    false_positive_likelihood: "Medium", confidence: 65, analyst_notes: ""
+  };
+
+  // ── SYSLOG ──────────────────────────────────────────────────────────────────
+  if (fmt === "Syslog") {
+    const failCount  = (t.match(/Failed password|authentication failure|Invalid user/gi) || []).length;
+    const targets    = uniq((t.match(/Failed password for (?:invalid user )?(\S+)/gi) || [])
+                        .map(m => m.replace(/failed password for (?:invalid user )?/i, "").trim()));
+    const rootHit    = targets.some(u => /^(root|admin|administrator)$/i.test(u));
+    const invalidUsr = /invalid user/i.test(t);
+
+    r.iocs = uniq([...ips, ...targets.map(u => `user:${u}`)]);
+    r.mitre_tactic = "Credential Access";
+    r.mitre_technique = "T1110.001 - Brute Force: Password Guessing";
+    r.threat_type = "Brute Force";
+
+    if (failCount >= 5 && rootHit) {
+      Object.assign(r, { severity: "CRITICAL", confidence: 95, false_positive_likelihood: "Low",
+        summary: `Brute-force SSH attack: ${failCount} failed attempts against privileged account(s) (${targets.join(", ")}) from ${ips.join(", ")}. Root targeting indicates automated attack with privilege-escalation intent.`,
+        recommended_action: `Block ${ips.join(", ")} at the firewall immediately. Verify no "Accepted password" entries follow in auth.log. Enable fail2ban. Rotate credentials for targeted accounts.` });
+    } else if (failCount >= 3) {
+      Object.assign(r, { severity: "HIGH", confidence: 88, false_positive_likelihood: "Low",
+        summary: `SSH brute force: ${failCount} rapid failed logins for "${targets.join(", ")}" from ${ips.join(", ")}. Repeated failures indicate automated credential attack.`,
+        recommended_action: `Block ${ips.join(", ")} at perimeter. Confirm no successful logins. Disable password auth in sshd_config and switch to key-only.` });
+    } else if (failCount >= 1) {
+      Object.assign(r, { severity: "LOW", confidence: 60, false_positive_likelihood: "High",
+        summary: `Failed SSH login for "${targets.join(", ")}" from ${ips.join(", ")}. Isolated failure — may be a misconfigured service or one-off attempt.`,
+        recommended_action: "Monitor for repeat attempts. No immediate action required." });
+    } else if (/sudo|su\b/i.test(t)) {
+      Object.assign(r, { threat_type: "Privilege Escalation", mitre_tactic: "Privilege Escalation",
+        mitre_technique: "T1548.003 - Sudo and Sudo Caching", severity: "MEDIUM", confidence: 65,
+        summary: "Sudo/su usage detected. Verify the user is authorised for elevation.",
+        recommended_action: "Review /etc/sudoers and compare against authorised admin list." });
+    } else {
+      r.summary = "Syslog event — no known attack pattern matched. Review manually.";
+      r.confidence = 40;
+    }
+    if (invalidUsr) r.analyst_notes = "Target username does not exist — consistent with credential stuffing or username enumeration.";
+  }
+
+  // ── WINDOWS EVENT LOG ────────────────────────────────────────────────────────
+  else if (fmt === "Windows Event Log") {
+    const eid      = parseInt((t.match(/EventID\s*:\s*(\d+)/i) || [])[1]) || 0;
+    const computer = (t.match(/Computer\s*:\s*(\S+)/i) || [])[1] || "unknown host";
+    const user     = (t.match(/User\s*:\s*([\w\\@.]+)/i) || [])[1] || "";
+    const cmdLine  = (t.match(/(?:CommandLine|ScriptBlockText)\s*:\s*(.+)/i) || [])[1] || "";
+    const dangerPS = /IEX|Invoke-Expression|DownloadString|WebClient|EncodedCommand|FromBase64String|bypass|hidden|noprofile|mimikatz|shellcode/i.test(t);
+    const lateral  = /(net\s+use|\\\\[\w.]+\\|psexec|wmic.*\/node)/i.test(t);
+    const persist  = /(HKCU|HKLM|\\Run\b|Startup|schtasks|at\.exe)/i.test(t);
+
+    r.iocs = uniq([...ips, user && `user:${user}`, `host:${computer}`, cmdLine && `cmd:${cmdLine.slice(0,80)}`]);
+
+    if ((eid === 4104 || (eid === 4688 && /powershell/i.test(t)))) {
+      Object.assign(r, {
+        threat_type: dangerPS ? "Malicious PowerShell" : "Suspicious PowerShell",
+        mitre_tactic: "Execution", mitre_technique: "T1059.001 - PowerShell",
+        severity: dangerPS ? "CRITICAL" : "HIGH", confidence: dangerPS ? 93 : 75,
+        false_positive_likelihood: dangerPS ? "Low" : "Medium",
+        summary: dangerPS
+          ? `Malicious PowerShell on ${computer} (user: ${user}). Script uses download cradle / in-memory execution (IEX/WebClient/EncodedCommand) — common loader technique for second-stage payloads.`
+          : `Suspicious PowerShell execution logged on ${computer}. Review script content for indicators.`,
+        recommended_action: `Isolate ${computer}. Decode full script block. Hunt for ${ips.join(", ") || "C2 IPs"} across environment. Check persistence (Run keys, scheduled tasks).`
+      });
+    } else if (eid === 4625) {
+      Object.assign(r, { threat_type: "Failed Logon", mitre_tactic: "Credential Access",
+        mitre_technique: "T1110 - Brute Force", severity: "MEDIUM", confidence: 68,
+        summary: `Windows failed logon (4625) on ${computer} for account ${user || "unknown"}.`,
+        recommended_action: "Correlate with other 4625 events to detect brute-force patterns. Check logon type and source network address." });
+    } else if (eid === 4688 && lateral) {
+      Object.assign(r, { threat_type: "Lateral Movement", mitre_tactic: "Lateral Movement",
+        mitre_technique: "T1021 - Remote Services", severity: "HIGH", confidence: 80,
+        summary: `Process creation (4688) on ${computer} with lateral movement indicators — remote admin tool or network share access.`,
+        recommended_action: "Trace execution chain. Identify source host. Verify against authorised admin activity." });
+    } else if (eid === 4688 && persist) {
+      Object.assign(r, { threat_type: "Persistence", mitre_tactic: "Persistence",
+        mitre_technique: "T1547.001 - Registry Run Keys", severity: "HIGH", confidence: 78,
+        summary: `Process on ${computer} is interacting with autostart registry keys or scheduled tasks — possible persistence mechanism.`,
+        recommended_action: "Audit Run keys and scheduled tasks on the host. Compare against known-good baseline." });
+    } else {
+      r.summary = `Windows Event ${eid} on ${computer}. No specific rule matched — review manually.`;
+      r.analyst_notes = "Add CommandLine, ParentProcess, or LogonType fields for better classification.";
+      r.confidence = 45;
+    }
+  }
+
+  // ── SURICATA JSON ────────────────────────────────────────────────────────────
+  else if (fmt === "Suricata JSON") {
+    let p = {};
+    try { p = JSON.parse(t); } catch { /**/ }
+    const sig      = p.alert?.signature || (t.match(/"signature"\s*:\s*"([^"]+)"/) || [])[1] || "";
+    const sev      = p.alert?.severity ?? 3;
+    const srcIP    = p.src_ip  || ips[0] || "";
+    const dstIP    = p.dest_ip || ips[1] || "";
+    const dstPort  = p.dest_port || "";
+    const category = p.alert?.category || "";
+
+    r.iocs = uniq([srcIP, dstIP, dstPort && `port:${dstPort}`, sig && `sig:${sig}`]);
+
+    if (/cobalt.?strike/i.test(sig)) {
+      Object.assign(r, { threat_type: "Cobalt Strike C2", mitre_tactic: "Command and Control",
+        mitre_technique: "T1071.001 - Web Protocols", severity: "CRITICAL", confidence: 92,
+        false_positive_likelihood: "Low",
+        summary: `Cobalt Strike beacon activity detected from internal host ${srcIP} to ${dstIP}:${dstPort}. Cobalt Strike is a commercial offensive framework widely used in targeted attacks and ransomware operations.`,
+        recommended_action: `Isolate ${srcIP} immediately. Capture memory. Block ${dstIP} at perimeter. Hunt all hosts communicating with ${dstIP}. Escalate to IR.` });
+    } else if (/malware|trojan|backdoor|\brat\b|beacon|c2/i.test(sig)) {
+      Object.assign(r, { threat_type: "Malware / C2", mitre_tactic: "Command and Control",
+        mitre_technique: "T1071 - Application Layer Protocol",
+        severity: sev <= 1 ? "CRITICAL" : "HIGH", confidence: 85, false_positive_likelihood: "Low",
+        summary: `IDS alert: ${sig} — malware traffic from ${srcIP} to ${dstIP}:${dstPort}.`,
+        recommended_action: `Investigate ${srcIP} for active infection. Block ${dstIP}. Review process list and network connections on source host.` });
+    } else if (/exploit|shellcode|overflow/i.test(sig)) {
+      Object.assign(r, { threat_type: "Exploit Attempt", mitre_tactic: "Initial Access",
+        mitre_technique: "T1190 - Exploit Public-Facing Application", severity: "HIGH", confidence: 78,
+        summary: `Exploit attempt: ${sig} from ${srcIP} targeting ${dstIP}:${dstPort}.`,
+        recommended_action: "Verify destination service is patched. Review access logs for exploitation indicators." });
+    } else if (/scan|sweep|probe/i.test(sig)) {
+      Object.assign(r, { threat_type: "Reconnaissance", mitre_tactic: "Reconnaissance",
+        mitre_technique: "T1595 - Active Scanning", severity: "LOW", confidence: 70,
+        false_positive_likelihood: "Medium",
+        summary: `Network scan from ${srcIP}. Signature: ${sig}.`,
+        recommended_action: `Block ${srcIP} if external. If internal, identify the scanning process.` });
+    } else {
+      r.severity   = sev <= 1 ? "HIGH" : sev <= 2 ? "MEDIUM" : "LOW";
+      r.summary    = `IDS alert: ${sig || "unknown"} from ${srcIP} to ${dstIP}.`;
+      r.threat_type = category || "IDS Alert";
+      r.confidence  = 60;
+    }
+  }
+
+  // ── ZEEK CONN.LOG ────────────────────────────────────────────────────────────
+  else if (fmt === "Zeek conn.log") {
+    const bytesOut   = Math.max(...(t.match(/\d{6,}/g) || ["0"]).map(Number));
+    const suspPorts  = [4444, 4445, 1337, 6666, 6667, 8888, 31337].filter(p => t.includes(String(p)));
+    const durationMs = parseFloat((t.match(/\b(\d{3,})\.\d+\s/) || [])[1]) || 0;
+
+    r.iocs = ips;
+
+    if (durationMs > 3000 && bytesOut > 1_000_000) {
+      Object.assign(r, { threat_type: "C2 Beacon", mitre_tactic: "Command and Control",
+        mitre_technique: "T1071 - Application Layer Protocol",
+        severity: "HIGH", confidence: 83, false_positive_likelihood: "Low",
+        summary: `Long-duration connection (${Math.round(durationMs/3600)}h) with high outbound data (${Math.round(bytesOut/1024/1024)}MB) — pattern consistent with C2 beaconing or data staging.`,
+        recommended_action: "Capture PCAP for this flow. Identify process on source host. Check destination IP reputation." });
+    } else if (suspPorts.length) {
+      Object.assign(r, { threat_type: "Suspicious Outbound Connection", mitre_tactic: "Command and Control",
+        mitre_technique: "T1571 - Non-Standard Port", severity: "HIGH", confidence: 78,
+        summary: `Connection on non-standard port(s) ${suspPorts.join(", ")} — commonly used by C2 frameworks and malware.`,
+        recommended_action: "Identify the process on the source host using that port. Check destination IP reputation." });
+    } else if (bytesOut > 50_000_000) {
+      Object.assign(r, { threat_type: "Potential Data Exfiltration", mitre_tactic: "Exfiltration",
+        mitre_technique: "T1048 - Exfiltration Over Alternative Protocol",
+        severity: "HIGH", confidence: 70,
+        summary: `Large data transfer (${Math.round(bytesOut/1024/1024)}MB) — potential exfiltration.`,
+        recommended_action: "Identify what data was transferred. Check DLP policies on source system." });
+    } else {
+      r.summary = "Zeek flow detected. No high-confidence threat pattern matched.";
+      r.analyst_notes = "Add dns.log or http.log entries for better analysis.";
+      r.confidence = 45;
+    }
+  }
+
+  // ── CEF ──────────────────────────────────────────────────────────────────────
+  else if (fmt === "CEF") {
+    const kv = {};
+    (t.match(/(\w+)=([^\s|]+)/g) || []).forEach(f => { const i = f.indexOf("="); kv[f.slice(0,i)] = f.slice(i+1); });
+    const threat   = kv.cs1 || kv.ThreatName || kv.msg || "";
+    const action   = (kv.act || kv.deviceAction || "").toLowerCase();
+    const src      = kv.src || ips[0] || "";
+    const dst      = kv.dst || ips[1] || "";
+    const blocked  = /block|deny|drop/.test(action);
+
+    r.iocs = uniq([...ips, threat && `threat:${threat}`]);
+
+    if (/mimikatz|lsass|credential.dump|hashdump/i.test(t)) {
+      Object.assign(r, { threat_type: "Credential Dumping", mitre_tactic: "Credential Access",
+        mitre_technique: "T1003 - OS Credential Dumping",
+        severity: blocked ? "HIGH" : "CRITICAL", confidence: 93, false_positive_likelihood: "Low",
+        summary: `Credential dumping tool (Mimikatz/lsass) detected on ${src}. Action: ${action || "unknown"}. Even if blocked, presence indicates an attacker with local access attempting credential harvest.`,
+        recommended_action: blocked
+          ? `Investigate ${src} for active compromise despite the block. Hunt lateral movement. Force credential reset for all accounts cached on ${src}.`
+          : `URGENT: Isolate ${src}. Assume all cached credentials are compromised. Force domain-wide password reset. Escalate to IR team.` });
+    } else if (/exploit|shellcode|overflow/i.test(t)) {
+      Object.assign(r, { threat_type: "Exploit Attempt", mitre_tactic: "Initial Access",
+        mitre_technique: "T1190 - Exploit Public-Facing Application",
+        severity: blocked ? "MEDIUM" : "HIGH", confidence: 80,
+        summary: `Exploit activity from ${src} to ${dst}. ${blocked ? "Blocked." : "Action: " + action}`,
+        recommended_action: "Patch the targeted service. Check for successful exploitation indicators on the destination." });
+    } else {
+      r.severity = blocked ? "LOW" : "MEDIUM";
+      r.summary = `CEF event from ${src} to ${dst}. ${threat || kv.msg || "Review raw event."}`;
+      r.threat_type = threat || "Security Policy Event";
+      r.confidence = 60;
+      if (blocked) r.false_positive_likelihood = "High";
+    }
+  }
+
+  // ── DNS LOG ──────────────────────────────────────────────────────────────────
+  else if (fmt === "DNS Log") {
+    const queries    = (t.match(/Query:\s*(\S+)/gi) || []).map(q => q.replace(/Query:\s*/i, ""));
+    const highEnt    = /entropy.*HIGH|Unusual_subdomain_entropy.*HIGH/i.test(t);
+    const b64Subs    = queries.filter(q => /^[A-Za-z0-9+/]{8,}=*\.[a-z]+\.[a-z]+/.test(q));
+    const bytesOut   = parseInt((t.match(/Bytes_out:\s*(\d+)/i) || [])[1]) || 0;
+    const rootDomain = (queries[0] || "").split(".").slice(-2).join(".");
+
+    r.iocs = uniq([...ips, ...queries.map(q => `dns:${q}`)]);
+
+    if (b64Subs.length > 0 || highEnt) {
+      Object.assign(r, { threat_type: "DNS Exfiltration", mitre_tactic: "Exfiltration",
+        mitre_technique: "T1048.003 - Exfiltration Over DNS",
+        severity: "HIGH", confidence: 90, false_positive_likelihood: "Low",
+        summary: `DNS exfiltration detected: Base64-encoded subdomains sent to ${rootDomain || "external domain"}. Stolen data is encoded into DNS query labels to bypass DLP controls. High subdomain entropy confirms anomalous usage.`,
+        recommended_action: `Sinkhole the destination domain at DNS resolver. Identify source host (${ips.join(", ")}). Decode subdomain labels to determine exfiltrated data. Hunt for the implant on the source.` });
+    } else if (bytesOut > 10_000) {
+      Object.assign(r, { threat_type: "DNS Tunneling", mitre_tactic: "Command and Control",
+        mitre_technique: "T1071.004 - DNS", severity: "MEDIUM", confidence: 68,
+        summary: `Unusual DNS query volume / high outbound bytes — possible DNS tunneling or C2 over DNS.`,
+        recommended_action: "Analyse query frequency, length, and uniqueness. Deploy DNS sinkhole if malicious domain confirmed." });
+    } else {
+      r.summary = "DNS log event. Review query destinations and frequency for anomalies.";
+      r.confidence = 50;
+    }
+  }
+
+  // ── FREE-FORM ────────────────────────────────────────────────────────────────
+  else {
+    const suspCmd  = /whoami|net\s+user|net\s+localgroup|ipconfig|nmap|mimikatz|psexec|procdump/i.test(t);
+    const lateral  = /\\\\[\w.]+\\[a-z$]+|admin\$|ipc\$|wmic.*\/node|psexec/i.test(t);
+    const malUrl   = /http:\/\/[^\s"']+\/(payload|shell|rat|agent|beacon|update\.exe|loader)/i.test(t);
+    const files    = uniq(t.match(/\b[\w.-]+\.(?:exe|ps1|bat|sh|dll|vbs)\b/gi) || []);
+    const hashes   = uniq((t.match(/\b[A-Fa-f0-9]{32,64}\b/g) || []).map(h => `hash:${h}`));
+
+    r.iocs = uniq([...ips, ...files, ...hashes]);
+
+    if (malUrl || lateral) {
+      Object.assign(r, { severity: "HIGH", false_positive_likelihood: "Medium", confidence: 65,
+        threat_type: malUrl ? "Malware Delivery" : "Lateral Movement",
+        mitre_tactic: malUrl ? "Initial Access" : "Lateral Movement",
+        mitre_technique: malUrl ? "T1566 - Phishing" : "T1021 - Remote Services",
+        summary: `Narrative contains indicators of ${malUrl ? "malware delivery" : "lateral movement"}. IPs: ${ips.join(", ") || "none"}.`,
+        recommended_action: "Correlate with endpoint and network logs. Validate source and destination of the activity." });
+    } else if (suspCmd) {
+      Object.assign(r, { severity: "MEDIUM", confidence: 60,
+        threat_type: "Suspicious Command Execution", mitre_tactic: "Discovery",
+        mitre_technique: "T1082 - System Information Discovery",
+        summary: "Narrative contains suspicious commands (whoami, net user, nmap, etc.) — possible attacker recon or post-exploitation.",
+        recommended_action: "Correlate with process creation logs on the affected host." });
+    } else {
+      Object.assign(r, { severity: "LOW", confidence: 40, false_positive_likelihood: "High",
+        summary: "Free-form narrative analysed. No specific threat pattern matched.",
+        analyst_notes: "Include specific IPs, usernames, commands, and timestamps for higher-confidence results." });
+    }
+  }
+
+  return r;
+}
+
+// ── END OFFLINE ENGINE ───────────────────────────────────────────────────────
+
 function ScanlineOverlay() {
   return (
     <div style={{
@@ -278,25 +562,6 @@ export default function SOCTriageTool() {
   const [diagnosis, setDiagnosis]       = useState(null);
   const [history, setHistory]           = useState([]);
   const [guideOpen, setGuideOpen]       = useState(false);
-  const [apiKey, setApiKey]             = useState(() => localStorage.getItem("groq_api_key") || "");
-  const [keyEntry, setKeyEntry]         = useState("");
-  const [showKeySetup, setShowKeySetup] = useState(false);
-
-  function saveKey() {
-    const k = keyEntry.trim();
-    if (!k) return;
-    localStorage.setItem("groq_api_key", k);
-    setApiKey(k);
-    setKeyEntry("");
-    setShowKeySetup(false);
-  }
-
-  function clearKey() {
-    localStorage.removeItem("groq_api_key");
-    setApiKey("");
-    setShowKeySetup(true);
-  }
-
   function handleInputChange(e) {
     setInput(e.target.value);
     if (validationIssues.length > 0) setValidationIssues([]);
@@ -304,157 +569,30 @@ export default function SOCTriageTool() {
     if (result) setResult(null);
   }
 
-  async function diagnoseBadInput(rawInput, errMsg) {
-    const prompt = `You are a SOC analyst and log format expert. A user submitted input to a security alert triage tool, but analysis failed.
-
-User input:
-"""
-${rawInput.slice(0, 800)}
-"""
-
-Error: ${errMsg}
-
-Diagnose what is wrong and give specific actionable guidance. Respond ONLY with valid JSON — no markdown, no backticks:
-{
-  "problem": "1-2 sentence explanation of what is wrong with this input",
-  "suggestions": ["fix 1", "fix 2", "fix 3"],
-  "example": "short corrected example showing what this input should look like (empty string if not applicable)"
-}`;
-
-    try {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          max_tokens: 500,
-          temperature: 0.2,
-          messages: [{ role: "user", content: prompt }]
-        })
-      });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(`API error ${res.status}: ${errData.error?.message || res.statusText}`);
-      }
-      const data = await res.json();
-      const text = data.choices?.[0]?.message?.content || "";
-      if (!text) throw new Error("Empty response from model");
-      return JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch (err) {
-      console.error("[SOC Triage] diagnoseBadInput error:", err);
-      return {
-        problem: `Analysis failed: ${err.message}`,
-        suggestions: [
-          "Check that your Groq API key is correct — click the key icon in the header to update it.",
-          "Get a free key at console.groq.com → API Keys.",
-          "Open DevTools → Console for the full error details."
-        ],
-        example: ""
-      };
-    }
-  }
-
   async function analyzeAlert() {
     const issues = VALIDATION_RULES.filter(r => r.test(input));
-    if (issues.length > 0) {
-      setValidationIssues(issues);
-      return;
-    }
+    if (issues.length > 0) { setValidationIssues(issues); return; }
 
     setLoading(true);
     setValidationIssues([]);
     setDiagnosis(null);
     setResult(null);
 
-    const prompt = `You are a senior SOC analyst. Analyze the following security log, SIEM alert, IDS event, or network log and return a structured triage assessment.
+    setLoadingStage("Detecting log format...");
+    await new Promise(r => setTimeout(r, 200));
+    setLoadingStage("Running triage analysis...");
+    await new Promise(r => setTimeout(r, 300));
 
-You will accept any format: syslog, Windows Event Log, Zeek/Bro, Suricata JSON, CEF, Splunk export, firewall log, or free-form incident narrative. Identify the format automatically and extract all relevant fields.
+    const parsed = analyzeOffline(input);
+    setResult(parsed);
+    setHistory(h => [{
+      input: input.slice(0, 60) + (input.length > 60 ? "..." : ""),
+      result: parsed,
+      ts: new Date().toLocaleTimeString()
+    }, ...h.slice(0, 4)]);
 
-If the input is ambiguous or missing some fields, make your best assessment and reflect uncertainty with a lower confidence score and honest analyst_notes.
-
-Respond ONLY with a valid JSON object — no markdown, no backticks, no preamble:
-{
-  "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFORMATIONAL",
-  "log_format_detected": "e.g. Syslog, Windows Event Log, Suricata JSON, Zeek conn.log, CEF, Free-form Narrative, Unknown",
-  "summary": "2-3 sentences: what happened, why it is suspicious, what the attacker may be attempting",
-  "threat_type": "short label e.g. Brute Force, Lateral Movement, C2 Beacon, Data Exfiltration, Privilege Escalation",
-  "mitre_tactic": "MITRE ATT&CK tactic name",
-  "mitre_technique": "Technique ID and name e.g. T1110.001 - Password Spraying",
-  "iocs": ["IPs", "domains", "hashes", "usernames", "commands", "filenames extracted from the input"],
-  "recommended_action": "Specific next step for the on-call analyst",
-  "false_positive_likelihood": "Low" | "Medium" | "High",
-  "confidence": 0-100,
-  "analyst_notes": "Any caveats about missing fields, assumptions made, or suggestions to improve the input quality"
-}
-
-Log/Alert Input:
-${input}`;
-
-    try {
-      const apiKey = apiKey;
-      if (!apiKey) throw new Error("No API key set — enter your Groq API key using the key icon in the header.");
-
-      setLoadingStage("Detecting log format...");
-      await new Promise(r => setTimeout(r, 350));
-      setLoadingStage("Running triage analysis...");
-
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          max_tokens: 1000,
-          temperature: 0.2,
-          messages: [{ role: "user", content: prompt }]
-        })
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(`API error ${res.status}: ${errData.error?.message || res.statusText}`);
-      }
-
-      const data = await res.json();
-      const text = data.choices?.[0]?.message?.content || "";
-      if (!text) throw new Error("Empty API response");
-
-      let parsed;
-      try {
-        parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      } catch (parseErr) {
-        setLoadingStage("Diagnosing input...");
-        setDiagnosis(await diagnoseBadInput(input, parseErr.message));
-        return;
-      }
-
-      setResult(parsed);
-      setHistory(h => [{
-        input: input.slice(0, 60) + (input.length > 60 ? "..." : ""),
-        result: parsed,
-        ts: new Date().toLocaleTimeString()
-      }, ...h.slice(0, 4)]);
-
-    } catch (e) {
-      console.error("[SOC Triage] analyzeAlert error:", e);
-      setDiagnosis({
-        problem: `Analysis error: ${e.message}`,
-        suggestions: [
-          "Check that your Groq API key is correct — click the key icon in the header to update it.",
-          "Get a free key at console.groq.com → API Keys.",
-          "Open DevTools → Console for the full error details."
-        ],
-        example: ""
-      });
-    } finally {
-      setLoading(false);
-      setLoadingStage("");
-    }
+    setLoading(false);
+    setLoadingStage("");
   }
 
   function loadSample(s) {
@@ -535,65 +673,15 @@ ${input}`;
 
       {/* Header */}
       <div style={{ borderBottom:"1px solid #1a2e24", padding:"24px 32px", display:"flex", alignItems:"center", gap:16, background:"rgba(0,255,136,0.02)" }}>
-        <div style={{ width:10, height:10, borderRadius:"50%", background: apiKey ? "#00ff88" : "#ff9f0a", animation:"pulse 2s infinite" }} />
+        <div style={{ width:10, height:10, borderRadius:"50%", background:"#00ff88", animation:"pulse 2s infinite" }} />
         <div>
           <div style={{ fontFamily:"'Orbitron',monospace", fontSize:13, fontWeight:700, letterSpacing:4, color:"#00ff88" }}>SOC TRIAGE</div>
-          <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginTop:1 }}>AI-POWERED ALERT ANALYSIS SYSTEM v2.0</div>
+          <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginTop:1 }}>ALERT ANALYSIS SYSTEM v2.0 // OFFLINE</div>
         </div>
-        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:16 }}>
-          <button
-            onClick={() => setShowKeySetup(s => !s)}
-            title={apiKey ? "API key set — click to change" : "No API key — click to set"}
-            style={{
-              background:"transparent", border:`1px solid ${apiKey ? "#1a2e24" : "#ff9f0a"}`,
-              color: apiKey ? "#3a5a48" : "#ff9f0a", padding:"4px 10px", fontSize:10,
-              cursor:"pointer", letterSpacing:1, fontFamily:"inherit", transition:"all 0.15s"
-            }}
-          >
-            {apiKey ? "⚿ KEY SET" : "⚿ SET API KEY"}
-          </button>
-          <span style={{ fontSize:10, color:"#3a5a48", letterSpacing:1 }}>
-            {new Date().toISOString().slice(0,19).replace("T"," ")} UTC
-          </span>
+        <div style={{ marginLeft:"auto", fontSize:10, color:"#3a5a48", letterSpacing:1 }}>
+          {new Date().toISOString().slice(0,19).replace("T"," ")} UTC
         </div>
       </div>
-
-      {/* API Key Setup Panel */}
-      {(!apiKey || showKeySetup) && (
-        <div style={{ background:"#0a1208", borderBottom:"1px solid #1a2e24", padding:"16px 32px", animation:"fadeIn 0.2s ease" }}>
-          <div style={{ maxWidth:960, margin:"0 auto", display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
-            <div style={{ fontSize:10, color: apiKey ? "#3a5a48" : "#ff9f0a", letterSpacing:2, flexShrink:0 }}>
-              {apiKey ? "// UPDATE GROQ API KEY" : "// GROQ API KEY REQUIRED"}
-            </div>
-            <input
-              type="password"
-              value={keyEntry}
-              onChange={e => setKeyEntry(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && saveKey()}
-              placeholder="gsk_..."
-              style={{
-                flex:1, minWidth:260, background:"#0d1517", border:"1px solid #1a2e24",
-                color:"#c9d8d3", padding:"6px 12px", fontSize:11, fontFamily:"inherit",
-                outline:"none"
-              }}
-            />
-            <button onClick={saveKey} disabled={!keyEntry.trim()} style={{
-              background:"transparent", border:"1px solid #00ff88", color:"#00ff88",
-              padding:"6px 16px", fontSize:10, cursor: keyEntry.trim() ? "pointer" : "default",
-              letterSpacing:2, fontFamily:"inherit", opacity: keyEntry.trim() ? 1 : 0.4
-            }}>SAVE</button>
-            {apiKey && (
-              <button onClick={clearKey} style={{
-                background:"transparent", border:"1px solid #2a1a08", color:"#5a4a38",
-                padding:"6px 12px", fontSize:10, cursor:"pointer", letterSpacing:1, fontFamily:"inherit"
-              }}>CLEAR</button>
-            )}
-            <span style={{ fontSize:10, color:"#3a5a48" }}>
-              Free key at <span style={{ color:"#5a8a6a" }}>console.groq.com</span>
-            </span>
-          </div>
-        </div>
-      )}
 
       <div style={{ maxWidth:960, margin:"0 auto", padding:"32px 24px" }}>
 
