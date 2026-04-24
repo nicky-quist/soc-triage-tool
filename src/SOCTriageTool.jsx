@@ -317,17 +317,22 @@ Diagnose what is wrong and give specific actionable guidance. Respond ONLY with 
           messages: [{ role: "user", content: prompt }]
         })
       });
-      if (!res.ok) throw new Error(`API error ${res.status}`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(`API error ${res.status}: ${errData.error?.message || res.statusText}`);
+      }
       const data = await res.json();
       const text = data.choices?.[0]?.message?.content || "";
+      if (!text) throw new Error("Empty response from model");
       return JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch {
+    } catch (err) {
+      console.error("[SOC Triage] diagnoseBadInput error:", err);
       return {
-        problem: "The input could not be recognized as a known security log or alert format.",
+        problem: `Analysis failed: ${err.message}`,
         suggestions: [
-          "Include a timestamp, source IP or hostname, and a description of the event.",
-          "Paste the raw log line directly from your SIEM, terminal, or event viewer — not a summary.",
-          "Expand the Format Guide at the top to see accepted formats and real examples."
+          "Make sure VITE_GROQ_KEY is set in your .env and the dev server was restarted.",
+          "Open DevTools → Console for the full error details.",
+          "If this is the deployed site, ensure the VITE_GROQ_KEY GitHub Secret is set and Actions ran."
         ],
         example: ""
       };
@@ -419,22 +424,15 @@ ${input}`;
 
     } catch (e) {
       console.error("[SOC Triage] analyzeAlert error:", e);
-      // Surface real errors (API key, network, auth) directly without re-calling the AI
-      const isInfraError = e.message.startsWith("API error") || e.message.includes("VITE_ANTHROPIC_KEY") || e.message === "Failed to fetch";
-      if (isInfraError) {
-        setDiagnosis({
-          problem: e.message,
-          suggestions: [
-            "Check that VITE_ANTHROPIC_KEY is set in your .env file (UTF-8, no spaces).",
-            "Restart the dev server after editing .env so Vite picks up the new value.",
-            "Open the browser DevTools → Console for the full error details."
-          ],
-          example: ""
-        });
-      } else {
-        setLoadingStage("Diagnosing input...");
-        setDiagnosis(await diagnoseBadInput(input, e.message));
-      }
+      setDiagnosis({
+        problem: `Analysis error: ${e.message}`,
+        suggestions: [
+          "Make sure VITE_GROQ_KEY is set in your .env file and the dev server was restarted.",
+          "If using the deployed site, ensure the VITE_GROQ_KEY GitHub Secret is set and the Actions workflow ran successfully.",
+          "Open DevTools → Console for the full error details."
+        ],
+        example: ""
+      });
     } finally {
       setLoading(false);
       setLoadingStage("");
