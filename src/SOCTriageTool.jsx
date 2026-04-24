@@ -145,7 +145,7 @@ const VALIDATION_RULES = [
     id: "no_context",
     test: (v) => {
       const t = v.trim();
-      const hasIndicator = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|EventID|sshd|powershell|CEF:|alert|signature|Failed|blocked|denied|src=|dst=|uid\b|\.exe|\.ps1|\.sh)/i.test(t);
+      const hasIndicator = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|EventID|sshd|powershell|CEF:|alert|signature|Failed|blocked|denied|src=|dst=|uid\b|\.exe|\.ps1|\.sh|action|severity|category|timestamp|proto)/i.test(t);
       return t.split(/\s+/).length < 6 && !hasIndicator;
     },
     message: "Not enough technical context to triage.",
@@ -304,17 +304,22 @@ Diagnose what is wrong and give specific actionable guidance. Respond ONLY with 
 }`;
 
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${import.meta.env.VITE_GROQ_KEY}`
+        },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: "llama-3.3-70b-versatile",
           max_tokens: 500,
+          temperature: 0.2,
           messages: [{ role: "user", content: prompt }]
         })
       });
+      if (!res.ok) throw new Error(`API error ${res.status}`);
       const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
+      const text = data.choices?.[0]?.message?.content || "";
       return JSON.parse(text.replace(/```json|```/g, "").trim());
     } catch {
       return {
@@ -366,22 +371,34 @@ Log/Alert Input:
 ${input}`;
 
     try {
+      const apiKey = import.meta.env.VITE_GROQ_KEY;
+      if (!apiKey) throw new Error("VITE_GROQ_KEY is not set — add it to your .env file and restart the dev server.");
+
       setLoadingStage("Detecting log format...");
       await new Promise(r => setTimeout(r, 350));
       setLoadingStage("Running triage analysis...");
 
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: "llama-3.3-70b-versatile",
           max_tokens: 1000,
+          temperature: 0.2,
           messages: [{ role: "user", content: prompt }]
         })
       });
 
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(`API error ${res.status}: ${errData.error?.message || res.statusText}`);
+      }
+
       const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "";
+      const text = data.choices?.[0]?.message?.content || "";
       if (!text) throw new Error("Empty API response");
 
       let parsed;
@@ -401,8 +418,23 @@ ${input}`;
       }, ...h.slice(0, 4)]);
 
     } catch (e) {
-      setLoadingStage("Diagnosing input...");
-      setDiagnosis(await diagnoseBadInput(input, e.message));
+      console.error("[SOC Triage] analyzeAlert error:", e);
+      // Surface real errors (API key, network, auth) directly without re-calling the AI
+      const isInfraError = e.message.startsWith("API error") || e.message.includes("VITE_ANTHROPIC_KEY") || e.message === "Failed to fetch";
+      if (isInfraError) {
+        setDiagnosis({
+          problem: e.message,
+          suggestions: [
+            "Check that VITE_ANTHROPIC_KEY is set in your .env file (UTF-8, no spaces).",
+            "Restart the dev server after editing .env so Vite picks up the new value.",
+            "Open the browser DevTools → Console for the full error details."
+          ],
+          example: ""
+        });
+      } else {
+        setLoadingStage("Diagnosing input...");
+        setDiagnosis(await diagnoseBadInput(input, e.message));
+      }
     } finally {
       setLoading(false);
       setLoadingStage("");
