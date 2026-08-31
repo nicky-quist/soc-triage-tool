@@ -655,23 +655,26 @@ export default function SOCTriageTool() {
       padding: "0 0 60px 0"
     }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Orbitron:wght@400;700;900&display=swap');
         @keyframes blink  { 0%,100%{opacity:1} 50%{opacity:0} }
         @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
         @keyframes pulse  { 0%,100%{box-shadow:0 0 0 0 rgba(0,255,136,0.4)} 50%{box-shadow:0 0 0 8px rgba(0,255,136,0)} }
-        .analyze-btn:hover:not(:disabled){ background:#00ff88 !important; color:#080c0e !important; }
-        .sample-btn:hover { border-color:#00ff88 !important; color:#00ff88 !important; }
-        .export-btn:hover { border-color:#00ff88 !important; color:#00ff88 !important; }
+        .analyze-btn:hover:not(:disabled){ background:#00ff88 !important; color:#080c0e !important; box-shadow:0 0 24px rgba(0,255,136,0.25) !important; }
+        .sample-btn:hover { border-color:#00ff88 !important; color:#00ff88 !important; background:rgba(0,255,136,0.05) !important; }
+        .export-btn:hover { border-color:#00ff88 !important; color:#00ff88 !important; background:rgba(0,255,136,0.05) !important; }
         .triage-result { animation: fadeIn 0.4s ease; }
         textarea { resize:vertical; }
         textarea:focus { outline:none; border-color:#00ff88 !important; box-shadow:0 0 0 1px #00ff88, 0 0 20px rgba(0,255,136,0.08) !important; }
-        ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:#0d1517} ::-webkit-scrollbar-thumb{background:#1e3028;border-radius:2px}
-        .ioc-tag:hover { background:rgba(0,255,136,0.15) !important; }
+        ::-webkit-scrollbar{width:5px} ::-webkit-scrollbar-track{background:#0a0f11} ::-webkit-scrollbar-thumb{background:#1e3028;border-radius:3px}
+        ::-webkit-scrollbar-thumb:hover{background:#00ff88}
+        .ioc-tag:hover { background:rgba(0,255,136,0.15) !important; border-color:#00ff8844 !important; }
+        .result-panel { transition: box-shadow 0.2s; }
+        .result-panel:hover { box-shadow: 0 0 0 1px #1a3a28; }
       `}</style>
 
       <ScanlineOverlay />
 
       {/* Header */}
+      <div style={{ height:3, background:"linear-gradient(90deg,#00ff88 0%,#00c8a0 60%,#006655 100%)" }} />
       <div style={{ borderBottom:"1px solid #1a2e24", padding:"24px 32px", display:"flex", alignItems:"center", gap:16, background:"rgba(0,255,136,0.02)" }}>
         <div style={{ width:10, height:10, borderRadius:"50%", background:"#00ff88", animation:"pulse 2s infinite" }} />
         <div>
@@ -770,7 +773,8 @@ export default function SOCTriageTool() {
 
             <div style={{
               border:`1px solid ${sev.color}`, background:sev.bg,
-              padding:"14px 20px", marginBottom:1,
+              padding:"14px 20px", marginBottom:result.confidence < 60 ? 0 : 8,
+              borderRadius: result.confidence < 60 ? "6px 6px 0 0" : 6,
               display:"flex", alignItems:"center", justifyContent:"space-between"
             }}>
               <div style={{ display:"flex", alignItems:"center", gap:12 }}>
@@ -785,20 +789,20 @@ export default function SOCTriageTool() {
             </div>
 
             {result.confidence < 60 && (
-              <div style={{ background:"rgba(255,159,10,0.05)", border:"1px solid rgba(255,159,10,0.25)", borderTop:"none", padding:"8px 20px", marginBottom:1 }}>
+              <div style={{ background:"rgba(255,159,10,0.05)", border:"1px solid rgba(255,159,10,0.25)", borderTop:"none", padding:"8px 20px", marginBottom:8, borderRadius:"0 0 6px 6px" }}>
                 <span style={{ fontSize:10, color:"#ff9f0a", letterSpacing:1 }}>⚠ LOW CONFIDENCE — </span>
                 <span style={{ fontSize:10, color:"#7a8a80" }}>Add timestamps, IPs, or more event context to improve accuracy.</span>
               </div>
             )}
 
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:1, marginBottom:1 }}>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:8 }}>
 
-              <div style={{ gridColumn:"1 / -1", background:"#0d1517", border:"1px solid #1a2e24", padding:20 }}>
+              <div className="result-panel" style={{ gridColumn:"1 / -1", background:"#0d1517", border:"1px solid #1a2e24", padding:20, borderRadius:6 }}>
                 <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginBottom:8 }}>// SUMMARY</div>
                 <div style={{ fontSize:13, lineHeight:1.8, color:"#c9d8d3" }}>{result.summary}</div>
               </div>
 
-              <div style={{ background:"#0d1517", border:"1px solid #1a2e24", padding:20 }}>
+              <div className="result-panel" style={{ background:"#0d1517", border:"1px solid #1a2e24", padding:20, borderRadius:6 }}>
                 <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginBottom:12 }}>// MITRE ATT&CK</div>
                 <div style={{ fontSize:11, color:"#5a8a6a", marginBottom:4 }}>TACTIC</div>
                 <div style={{ fontSize:13, color:"#c9d8d3", marginBottom:12 }}>{result.mitre_tactic}</div>
@@ -806,7 +810,7 @@ export default function SOCTriageTool() {
                 <div style={{ fontSize:13, color:"#00ff88" }}>{result.mitre_technique}</div>
               </div>
 
-              <div style={{ background:"#0d1517", border:"1px solid #1a2e24", padding:20 }}>
+              <div className="result-panel" style={{ background:"#0d1517", border:"1px solid #1a2e24", padding:20, borderRadius:6 }}>
                 <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginBottom:12 }}>// ASSESSMENT</div>
                 <div style={{ fontSize:11, color:"#5a8a6a", marginBottom:4 }}>FALSE POSITIVE LIKELIHOOD</div>
                 <div style={{ fontSize:20, fontFamily:"'Orbitron',monospace", fontWeight:700,
@@ -815,7 +819,7 @@ export default function SOCTriageTool() {
                 </div>
               </div>
 
-              <div style={{ gridColumn:"1 / -1", background:"#0d1517", border:"1px solid #1a2e24", padding:20 }}>
+              <div className="result-panel" style={{ gridColumn:"1 / -1", background:"#0d1517", border:"1px solid #1a2e24", padding:20, borderRadius:6 }}>
                 <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginBottom:12 }}>// INDICATORS OF COMPROMISE</div>
                 {result.iocs?.length > 0 ? (
                   <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
@@ -832,13 +836,13 @@ export default function SOCTriageTool() {
                 )}
               </div>
 
-              <div style={{ gridColumn:"1 / -1", background:"#0a1812", border:`1px solid ${sev.color}33`, padding:20 }}>
+              <div className="result-panel" style={{ gridColumn:"1 / -1", background:"#0a1812", border:`1px solid ${sev.color}33`, padding:20, borderRadius:6 }}>
                 <div style={{ fontSize:10, color:sev.color, opacity:0.6, letterSpacing:2, marginBottom:8 }}>// RECOMMENDED ACTION</div>
                 <div style={{ fontSize:13, color:"#c9d8d3", lineHeight:1.7 }}>→ {result.recommended_action}</div>
               </div>
 
               {result.analyst_notes && (
-                <div style={{ gridColumn:"1 / -1", background:"#0d1517", border:"1px solid #1a2e24", padding:20 }}>
+                <div className="result-panel" style={{ gridColumn:"1 / -1", background:"#0d1517", border:"1px solid #1a2e24", padding:20, borderRadius:6 }}>
                   <div style={{ fontSize:10, color:"#3a5a48", letterSpacing:2, marginBottom:8 }}>// ANALYST NOTES</div>
                   <div style={{ fontSize:11, color:"#5a8a6a", lineHeight:1.7 }}>{result.analyst_notes}</div>
                 </div>
