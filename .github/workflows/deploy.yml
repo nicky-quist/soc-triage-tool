@@ -1,56 +1,23 @@
-name: CI and deploy
+name: Deploy redirect to GitHub Pages
 
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# The tool moved into the SOC Analyst Console. This publishes a single
+# redirect page so the old demo URL still lands on the Triage tab.
 jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Test rule engine
-        run: npm test
-
-      - name: Build
-        run: npm run build
-
-  # Deploy only from main, and only once lint, tests and build have passed -
-  # a broken rule engine should never reach the live demo.
   deploy:
-    needs: ci
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
-
-      - run: npm run build
 
       - uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
+          publish_dir: ./site
           enable_jekyll: false
